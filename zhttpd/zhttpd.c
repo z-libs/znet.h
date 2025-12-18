@@ -25,7 +25,6 @@
 #if defined(_WIN32)
 #   define WIN32_LEAN_AND_MEAN
 #   include <winsock2.h>
-#   define write(fd, buf, len) send(fd, buf, len, 0)
 #endif
 
 #define ZERROR_IMPLEMENTATION
@@ -46,6 +45,22 @@
 #include <time.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+#   define write(fd, buf, len) send(fd, buf, len, 0)
+#endif
+
+// Helper to get file modification time.
+static time_t get_file_mtime(const char *path) 
+{
+    struct stat st;
+    if (stat(path, &st) == 0) 
+    {
+        return st.st_mtime;
+    }
+    return 0;
+}
 
 // Defaults.
 
@@ -53,7 +68,13 @@
 #define DEFAULT_THREADS 128
 #define DEFAULT_TIMEOUT 5000
 #define DEFAULT_CHUNK 16384
-#define MAX_HEADER_SIZE 8192 
+#define MAX_HEADER_SIZE 8192
+
+// Cache defaults.
+#define DEFAULT_CACHE_ENABLED 1
+#define DEFAULT_CACHE_MAX_SIZE (64 * 1024 * 1024)  // 64 MB total cache
+#define DEFAULT_CACHE_MAX_FILE (1 * 1024 * 1024)   // 1 MB max per file
+#define DEFAULT_CACHE_ENTRIES 1024                  // Max cached files 
 
 // Globals.
 
@@ -62,6 +83,12 @@ int g_threads = DEFAULT_THREADS;
 int g_timeout = DEFAULT_TIMEOUT;
 int g_chunk_size = DEFAULT_CHUNK;
 char g_root[1024] = ".";
+
+// Cache globals.
+int g_cache_enabled = DEFAULT_CACHE_ENABLED;
+size_t g_cache_max_size = DEFAULT_CACHE_MAX_SIZE;
+size_t g_cache_max_file = DEFAULT_CACHE_MAX_FILE;
+int g_cache_max_entries = DEFAULT_CACHE_ENTRIES;
 
 typedef struct 
 {
@@ -79,6 +106,34 @@ typedef struct
 } ThreadPool;
 
 ThreadPool pool;
+
+// File cache entry.
+typedef struct CacheEntry 
+{
+    char *path;              // File path (key)
+    char *data;              // File contents
+    size_t size;             // File size
+    time_t mtime;            // Last modification time
+    time_t last_access;      // Last access time (for LRU)
+    struct CacheEntry *prev; // LRU list prev
+    struct CacheEntry *next; // LRU list next
+} CacheEntry;
+
+// File cache.
+typedef struct 
+{
+    CacheEntry **buckets;    // Hash table buckets
+    int bucket_count;        // Number of buckets
+    CacheEntry *lru_head;    // Most recently used
+    CacheEntry *lru_tail;    // Least recently used
+    size_t total_size;       // Total cached bytes
+    int entry_count;         // Number of cached files
+    zmutex_t lock;           // Thread safety
+    size_t hits;             // Cache hits
+    size_t misses;           // Cache misses
+} FileCache;
+
+FileCache g_cache;
 
 // Signal handler.
 void handle_sig(int sig) 
@@ -103,6 +158,208 @@ void handle_sig(int sig)
         const char msg[] = "\n[?] Press Ctrl+C again to stop server.\n";
         write(1, msg, sizeof(msg) - 1);
     }
+}
+
+// =========================================================================
+// FILE CACHE FUNCTIONS
+// =========================================================================
+
+// Simple hash function for file paths.
+static unsigned int cache_hash(const char *path) 
+{
+    unsigned int hash = 5381;
+    while (*path) 
+    {
+        hash = ((hash << 5) + hash) + (unsigned char)(*path++);
+    }
+    return hash;
+}
+
+// Initialize the cache.
+void cache_init(void) 
+{
+    if (!g_cache_enabled) return;
+    
+    g_cache.bucket_count = g_cache_max_entries;
+    g_cache.buckets = (CacheEntry**)calloc(g_cache.bucket_count, sizeof(CacheEntry*));
+    g_cache.lru_head = NULL;
+    g_cache.lru_tail = NULL;
+    g_cache.total_size = 0;
+    g_cache.entry_count = 0;
+    g_cache.hits = 0;
+    g_cache.misses = 0;
+    zmutex_init(&g_cache.lock);
+}
+
+// Free a cache entry.
+static void cache_free_entry(CacheEntry *entry) 
+{
+    if (entry) 
+    {
+        free(entry->path);
+        free(entry->data);
+        free(entry);
+    }
+}
+
+// Move entry to front of LRU list (most recently used).
+static void cache_lru_touch(CacheEntry *entry) 
+{
+    if (entry == g_cache.lru_head) return; // Already at front
+    
+    // Remove from current position
+    if (entry->prev) entry->prev->next = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    if (entry == g_cache.lru_tail) g_cache.lru_tail = entry->prev;
+    
+    // Insert at front
+    entry->prev = NULL;
+    entry->next = g_cache.lru_head;
+    if (g_cache.lru_head) g_cache.lru_head->prev = entry;
+    g_cache.lru_head = entry;
+    if (!g_cache.lru_tail) g_cache.lru_tail = entry;
+    
+    entry->last_access = time(NULL);
+}
+
+// Remove entry from hash table and LRU list.
+static void cache_remove_entry(CacheEntry *entry) 
+{
+    // Remove from hash table
+    unsigned int idx = cache_hash(entry->path) % g_cache.bucket_count;
+    CacheEntry *curr = g_cache.buckets[idx];
+    CacheEntry *prev_bucket = NULL;
+    
+    while (curr) 
+    {
+        if (curr == entry) 
+        {
+            if (prev_bucket) 
+                prev_bucket->next = curr->next;
+            else 
+                g_cache.buckets[idx] = curr->next;
+            break;
+        }
+        prev_bucket = curr;
+        curr = curr->next;
+    }
+    
+    // Remove from LRU list
+    if (entry->prev) entry->prev->next = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    if (entry == g_cache.lru_head) g_cache.lru_head = entry->next;
+    if (entry == g_cache.lru_tail) g_cache.lru_tail = entry->prev;
+    
+    g_cache.total_size -= entry->size;
+    g_cache.entry_count--;
+}
+
+// Evict least recently used entries until we have enough space.
+static void cache_evict(size_t needed_size) 
+{
+    while (g_cache.lru_tail && 
+           (g_cache.total_size + needed_size > g_cache_max_size || 
+            g_cache.entry_count >= g_cache_max_entries)) 
+    {
+        CacheEntry *victim = g_cache.lru_tail;
+        cache_remove_entry(victim);
+        cache_free_entry(victim);
+    }
+}
+
+// Look up a file in the cache. Returns NULL if not found or stale.
+CacheEntry* cache_lookup(const char *path) 
+{
+    if (!g_cache_enabled || !g_cache.buckets) return NULL;
+    
+    unsigned int idx = cache_hash(path) % g_cache.bucket_count;
+    CacheEntry *entry = g_cache.buckets[idx];
+    
+    while (entry) 
+    {
+        if (strcmp(entry->path, path) == 0) 
+        {
+            // Check if file was modified since cached
+            time_t current_mtime = get_file_mtime(path);
+            if (current_mtime != entry->mtime) 
+            {
+                // File changed, remove stale entry
+                cache_remove_entry(entry);
+                cache_free_entry(entry);
+                return NULL;
+            }
+            cache_lru_touch(entry);
+            return entry;
+        }
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+// Insert a file into the cache.
+CacheEntry* cache_insert(const char *path, const char *data, size_t size, time_t mtime) 
+{
+    if (!g_cache_enabled || !g_cache.buckets) return NULL;
+    if (size > g_cache_max_file) return NULL; // Too big to cache
+    
+    // Evict if necessary
+    cache_evict(size);
+    
+    // Create new entry
+    CacheEntry *entry = (CacheEntry*)malloc(sizeof(CacheEntry));
+    if (!entry) return NULL;
+    
+    entry->path = strdup(path);
+    entry->data = (char*)malloc(size);
+    if (!entry->path || !entry->data) 
+    {
+        free(entry->path);
+        free(entry->data);
+        free(entry);
+        return NULL;
+    }
+    
+    memcpy(entry->data, data, size);
+    entry->size = size;
+    entry->mtime = mtime;
+    entry->last_access = time(NULL);
+    entry->prev = NULL;
+    entry->next = NULL;
+    
+    // Add to hash table
+    unsigned int idx = cache_hash(path) % g_cache.bucket_count;
+    entry->next = g_cache.buckets[idx];
+    if (g_cache.buckets[idx]) g_cache.buckets[idx]->prev = entry;
+    g_cache.buckets[idx] = entry;
+    
+    // Add to LRU front
+    entry->next = g_cache.lru_head;
+    entry->prev = NULL;
+    if (g_cache.lru_head) g_cache.lru_head->prev = entry;
+    g_cache.lru_head = entry;
+    if (!g_cache.lru_tail) g_cache.lru_tail = entry;
+    
+    g_cache.total_size += size;
+    g_cache.entry_count++;
+    
+    return entry;
+}
+
+// Free the entire cache.
+void cache_destroy(void) 
+{
+    if (!g_cache.buckets) return;
+    
+    CacheEntry *curr = g_cache.lru_head;
+    while (curr) 
+    {
+        CacheEntry *next = curr->next;
+        cache_free_entry(curr);
+        curr = next;
+    }
+    
+    free(g_cache.buckets);
+    g_cache.buckets = NULL;
 }
 
 void load_config(const char *filename) 
@@ -130,6 +387,22 @@ void load_config(const char *filename)
             if (zstr_view_eq(key, "threads"))    zstr_view_to_int(val, &g_threads);
             if (zstr_view_eq(key, "timeout"))    zstr_view_to_int(val, &g_timeout);
             if (zstr_view_eq(key, "chunk_size")) zstr_view_to_int(val, &g_chunk_size);
+            
+            // Cache settings
+            if (zstr_view_eq(key, "cache_enabled")) zstr_view_to_int(val, &g_cache_enabled);
+            if (zstr_view_eq(key, "cache_max_size")) 
+            {
+                int mb = 0;
+                zstr_view_to_int(val, &mb);
+                g_cache_max_size = (size_t)mb * 1024 * 1024;
+            }
+            if (zstr_view_eq(key, "cache_max_file")) 
+            {
+                int kb = 0;
+                zstr_view_to_int(val, &kb);
+                g_cache_max_file = (size_t)kb * 1024;
+            }
+            if (zstr_view_eq(key, "cache_max_entries")) zstr_view_to_int(val, &g_cache_max_entries);
             
             if (zstr_view_eq(key, "root")) 
             {
@@ -209,6 +482,44 @@ bool send_all(znet_socket s, const char *buf, size_t len)
 
 void serve_file(znet_socket client, const char *full_path, int status_code, bool keep_alive, char *buffer, size_t buf_len) 
 {
+    CacheEntry *cached = NULL;
+    
+    // Try cache lookup (with lock for thread safety)
+    if (g_cache_enabled) 
+    {
+        zmutex_lock(&g_cache.lock);
+        cached = cache_lookup(full_path);
+        if (cached) 
+        {
+            g_cache.hits++;
+            
+            // Build and send header
+            zstr header = zstr_init();
+            zstr_fmt(&header, 
+                "HTTP/1.1 %d %s\r\n"
+                "Server: zhttpd/1.1\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: %s\r\n"
+                "X-Cache: HIT\r\n\r\n", 
+                status_code, (status_code == 200 ? "OK" : "Not Found"),
+                get_mime(full_path), 
+                cached->size,
+                keep_alive ? "keep-alive" : "close");
+            
+            send_all(client, zstr_cstr(&header), zstr_len(&header));
+            zstr_free(&header);
+            
+            // Send cached data
+            send_all(client, cached->data, cached->size);
+            zmutex_unlock(&g_cache.lock);
+            return;
+        }
+        g_cache.misses++;
+        zmutex_unlock(&g_cache.lock);
+    }
+    
+    // Cache miss - read from file
     FILE *f = fopen(full_path, "rb");
     if (!f) 
     {
@@ -218,6 +529,30 @@ void serve_file(znet_socket client, const char *full_path, int status_code, bool
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    
+    // Determine if file should be cached
+    bool should_cache = g_cache_enabled && (size_t)fsize <= g_cache_max_file;
+    char *file_data = NULL;
+    
+    if (should_cache) 
+    {
+        // Read entire file for caching
+        file_data = (char*)malloc(fsize);
+        if (file_data) 
+        {
+            if (fread(file_data, 1, fsize, f) != (size_t)fsize) 
+            {
+                free(file_data);
+                file_data = NULL;
+                should_cache = false;
+                fseek(f, 0, SEEK_SET); // Reset for normal read
+            }
+        } 
+        else 
+        {
+            should_cache = false;
+        }
+    }
 
     zstr header = zstr_init();
     zstr_fmt(&header, 
@@ -225,7 +560,8 @@ void serve_file(znet_socket client, const char *full_path, int status_code, bool
         "Server: zhttpd/1.1\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %ld\r\n"
-        "Connection: %s\r\n\r\n", 
+        "Connection: %s\r\n"
+        "X-Cache: MISS\r\n\r\n", 
         status_code, (status_code == 200 ? "OK" : "Not Found"),
         get_mime(full_path), 
         fsize,
@@ -234,12 +570,27 @@ void serve_file(znet_socket client, const char *full_path, int status_code, bool
     send_all(client, zstr_cstr(&header), zstr_len(&header));
     zstr_free(&header);
 
-    size_t n;
-    while ((n = fread(buffer, 1, buf_len, f)) > 0) 
+    if (should_cache && file_data) 
     {
-        if (!send_all(client, buffer, n)) 
+        // Send from cached data and add to cache
+        send_all(client, file_data, fsize);
+        
+        zmutex_lock(&g_cache.lock);
+        cache_insert(full_path, file_data, fsize, get_file_mtime(full_path));
+        zmutex_unlock(&g_cache.lock);
+        
+        free(file_data);
+    } 
+    else 
+    {
+        // Stream file in chunks
+        size_t n;
+        while ((n = fread(buffer, 1, buf_len, f)) > 0) 
         {
-            break;
+            if (!send_all(client, buffer, n)) 
+            {
+                break;
+            }
         }
     }
     fclose(f);
@@ -444,11 +795,25 @@ zres run_server(int argc, char **argv)
     zthread_t *threads = (zthread_t*)malloc(sizeof(zthread_t) * g_threads);
     ensure(threads != NULL, 4, "Thread alloc failed");
 
+    // Initialize file cache
+    cache_init();
+
     printf("=> zhttpd v1.9\n");
     printf("   Root:    %s\n", g_root);
     printf("   Port:    %d\n", g_port);
     printf("   Threads: %d\n", g_threads);
     printf("   Chunk:   %d bytes\n", g_chunk_size);
+    if (g_cache_enabled) 
+    {
+        printf("   Cache:   enabled (max %zu MB, %zu KB/file, %d entries)\n", 
+            g_cache_max_size / (1024*1024), 
+            g_cache_max_file / 1024, 
+            g_cache_max_entries);
+    } 
+    else 
+    {
+        printf("   Cache:   disabled\n");
+    }
 
     for (int i = 0; i < g_threads; i++) 
     {
@@ -491,6 +856,19 @@ zres run_server(int argc, char **argv)
     free(pool.queue);
     znet_close(&server);
     znet_term();
+    
+    // Show cache stats and cleanup
+    if (g_cache_enabled && g_cache.buckets) 
+    {
+        size_t total = g_cache.hits + g_cache.misses;
+        double hit_rate = total > 0 ? (100.0 * g_cache.hits / total) : 0.0;
+        printf("\n[Cache Stats]\n");
+        printf("   Hits:   %zu\n", g_cache.hits);
+        printf("   Misses: %zu\n", g_cache.misses);
+        printf("   Rate:   %.1f%%\n", hit_rate);
+        printf("   Size:   %zu KB in %d files\n", g_cache.total_size / 1024, g_cache.entry_count);
+    }
+    cache_destroy();
     
     return zres_ok();
 }
