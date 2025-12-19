@@ -10,7 +10,7 @@ get_dependencies:
 	cp ../znet.h .
 
 compile:
-	gcc zhttpd.c -o zhttpd -std=c11
+	gcc zhttpd.c -o zhttpd -std=c11 -O2
 
 clean:
 	@echo "Removing dependencies..."
