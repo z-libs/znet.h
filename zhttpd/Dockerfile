@@ -7,7 +7,7 @@ WORKDIR /build
 
 COPY . .
 
-RUN gcc zhttpd.c -o zhttpd -std=c11 -O2 -I. -D_POSIX_C_SOURCE=200809L
+RUN gcc zhttpd_std.c -o zhttpd -std=c11 -O2 -I. -D_POSIX_C_SOURCE=200809L
 
 FROM alpine:latest
 

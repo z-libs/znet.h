@@ -1,13 +1,13 @@
 
-/* zhttpd.c - v1.2.0 Production
+/* zhttpd_std.c - v1.2.0 Production
  *
  * Usage:
  *   ./zhttpd [DIR] [PORT] [THREADS]
- *   Example: ./zhttpd . 8080 512
+ *   Example: ./zhttpd_std . 8080 512
  *
  *  COMPILE:
- *   Linux:   gcc zhttpd.c -o zhttpd -std=c11
- *   Windows: gcc zhttpd.c -o zhttpd.exe -lws2_32 -std=c11
+ *   Linux:   gcc zhttpd_std.c -o zhttpd -std=c11
+ *   Windows: gcc zhttpd_std.c -o zhttpd.exe -lws2_32 -std=c11
  *
  *  OR BUILD:
  *   Linux: make
