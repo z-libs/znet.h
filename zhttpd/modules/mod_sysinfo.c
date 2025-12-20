@@ -1,4 +1,8 @@
 
+#if defined (_WIN32)
+#   warning "Not available on Windows."
+#else
+
 #include <sys/sysinfo.h>
 #include "../zmodule.h"
 
@@ -69,3 +73,6 @@ zmodule_def z_module_entry =
     .name = "SysInfo", 
     .handler = sysinfo_handler 
 };
+
+#endif
+
